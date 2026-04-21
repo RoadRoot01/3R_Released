@@ -121,6 +121,21 @@ io.on('connection', socket => {
              * @type {{peerid: string, socket: any, roomid: string, parentid: string | null, childrenids: string[],
              * isBroadcaster: boolean, isFull: boolean, numberOfViewers: number, isBroadcaster active: boolean, treeLevel: number, isRoot: boolean}}
              */
+
+            const currentRoomPeerCount = listOfBroadcasts[room]
+                ? Object.keys(listOfBroadcasts[room].allpeers).length
+                : 0;
+
+            // 입장 순서 기준
+            // 0명 있었으면 지금 들어오는 피어가 1번째(root)
+            // 1명 있었으면 지금 들어오는 피어가 2번째 -> VP8
+            // 2명 이상 있었으면 지금 들어오는 피어가 3번째 이상 -> H264
+            let codecPolicy = 'default';
+            if (currentRoomPeerCount === 1) {
+                codecPolicy = 'vp8';
+            } else if (currentRoomPeerCount >= 2) {
+                codecPolicy = 'h264';
+            }
             const peer = {
                 peerid: myid,
                 socket: socket,
@@ -132,7 +147,8 @@ io.on('connection', socket => {
                 numberOfViewers: 0,
                 treeLevel: -1,           // root=0, child=1, ...
                 active: true,
-                isRoot: false
+                isRoot: false,
+                codecPolicy
             };
 
             // room 별 broadcast 구조 초기화
@@ -159,6 +175,8 @@ io.on('connection', socket => {
 
             // 본인 id 전송
             socket.emit('my-id', myid);
+            // 2026-04-20 수정: 순서에 따른 코덱 선호도 설정
+            socket.emit('codec-policy', codecPolicy);
 
             // 첫 브로드캐스터(부모) 탐색
             var firstBroadcaster = getFirstAvailableBroadcaster(peer);
@@ -410,9 +428,18 @@ io.on('connection', socket => {
             }
         }
     }
-
+    /*
+     const sourcePeer = peers.get(id);
+     기존 emit {from,data} -> {from, data, codecPolicy} 로 변경
+     targetPeer.socket.emit('offer', {
+        from: id,
+        data,
+        codecPolicy: sourcePeer?.codecPolicy || 'default'
+    });
+    */
     socket.on('offer', ({ to, data }) => {
         const targetPeer = peers.get(to);
+        const sourcePeer = peers.get(id);
         if (!targetPeer || !targetPeer.socket || !targetPeer.active) {   // 없으면 여기서 drop
             const from = socket.data?.peerid ?? 'unknown';
             console.warn(`[Server] Drop offer: target missing. from=${from}, to=${to}`);
@@ -420,18 +447,28 @@ io.on('connection', socket => {
             socket.emit('droppedOffer-redial', { from: id, to });
             return;
         }
-        targetPeer.socket.emit('offer', { from: id, data });
+        targetPeer.socket.emit('offer', {
+            from: id,
+            data,
+            codecPolicy: sourcePeer?.codecPolicy || 'default'
+        });
         console.log(`[Server] Offer from ${id} to ${to}`);
     });
     socket.on('offer-renegotiate', ({ to, data }) => {
         const targetPeer = peers.get(to);
+        const sourcePeer = peers.get(id);
+
         if (!targetPeer || !targetPeer.socket || !targetPeer.active) {   // 없으면 여기서 drop
             const from = socket.data?.peerid ?? 'unknown';
             console.warn(`[Server] Drop offer-renegotiate: target missing. from=${from}, to=${to}`);
             return;
         }
-        targetPeer.socket.emit('offer', { from: id, data });
-        console.log(`[Server] Offer from ${id} to ${to}`);
+        targetPeer.socket.emit('offer', {
+            from: id,
+            data,
+            codecPolicy: sourcePeer?.codecPolicy || 'default'
+        });
+        console.log(`[Server] Offer-renegotiate from ${id} to ${to}`);
     });
     //<kau> Send an answer to the peer sent an offer
     socket.on('answer', ({ to, data }) => {

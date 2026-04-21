@@ -10,18 +10,19 @@
     8) 비트레이트 제한(SDP b=AS 삽입 / sender.setParameters)
 
 */
-
 import React, { use, useCallback, useEffect, useRef, useState } from 'react';
 // import logo from './logo.svg';
 import './App.css';
-import io from 'socket.io-client';
+
+import { io, Socket } from 'socket.io-client';
 import Video from './component/remoteVideo';
 
 export interface WebRTCUser {
     id: string;
-    socket: SocketIOClient.Socket;
+    socket: Socket;
     stream: MediaStream;
 }
+
 
 type BitrateLevel = 'min' | 'medium' | 'max';
 const BitrateConfig: Record<BitrateLevel, number> = {
@@ -61,7 +62,8 @@ const constraints = { // <DG> 해상도 및 프레임레이트 제약 설정 프
 // const MODE: string = '1_TO_N'; // '1_TO_N' or 'MESH'
 
 // 소켓 인스턴스를 컴포넌트 외부에서 한 번만 생성하여 재렌더링 시 재생성을 방지?
-export const SIGNALING_SERVER_URL = `https://192.168.1.4:8000`
+export const SIGNALING_SERVER_URL = `https://192.168.219.103:8000`;
+
 
 // const socket = io(`https://192.168.0.8:8000`, { autoConnect: false });
 const pcConfig: RTCConfiguration = {
@@ -93,7 +95,7 @@ function App() {
 
     /* UseRef 사용하지 않으면 랜더링시 초기화 문제 발생 */
     /* useRef 기반 상태 보존: 렌더링과 무관한 연결 객체/버퍼/스트림 보존 */
-    const socketRef = useRef<SocketIOClient.Socket | null>(null);
+    const socketRef = useRef<Socket | null>(null);
     /* 피어별 RTCPeerConnection 관리: peerId → RTCPeerConnection 매핑 */
     const pcsRef = useRef<Record<string, RTCPeerConnection>>({}); // peerId를 키(Key)로 하여 여러 명과의 연결 객체를 관리하고 있음
     /* 피어별 Redial 횟수관리: peerId → Redial 매핑 */
@@ -111,6 +113,8 @@ function App() {
 
     const hasStreamChangedRef = useRef<boolean>(false);
     const pcTypesRef = useRef<Record<string, string>>({});
+    // 2026-04-20 codec 정책 관리용 Ref (default, vp8, h264)
+    const myCodecPolicyRef = useRef<'default' | 'vp8' | 'h264'>('default');
 
     // 사용자 상태(React state)
     const [users, setUsers] = useState<WebRTCUser[]>([]);
@@ -280,7 +284,7 @@ function App() {
 
     // 비디오 컴포넌트 이외는 한 번만 렌더링
     useEffect(() => {
-        socketRef.current = io.connect(SIGNALING_SERVER_URL, { autoConnect: false });
+        socketRef.current = io(SIGNALING_SERVER_URL, { autoConnect: false });
         // 수동으로 연결 시작
         socketRef.current?.connect();
         console.log('Local stream obtained:', localStreamRef.current);
@@ -302,6 +306,12 @@ function App() {
             setMyid(id);
             console.log('My ID set to state:', myidRef.current);
         });
+        // 2026-04-20 서버에서 codec 정책 수신 처리 추가
+        socketRef.current.on('codec-policy', (policy: 'default' | 'vp8' | 'h264') => {
+            myCodecPolicyRef.current = policy;
+            console.log('[Peer] My codec policy:', policy);
+        });
+
         socketRef.current.on('new-parent', async (parentid: string) => {
             console.log('[Peer] my Parent in room:', parentid);
             // <DG> 중복된 연결 생성 방지 로직 추가
@@ -309,9 +319,9 @@ function App() {
                 console.warn(`[Peer] Connection to ${parentid} already exists. Skipping duplicate existing-peers event.`);
                 return; // for문 건너뛰어 다음 peerid로 이동하여 중복된 연결 생성 방지
             }
-
+            // 2026-04-20 codec 정책 전달 추가
             // 트리구조이기 때문에 recvonly 연결 생성
-            const pc = createPeerConnection(parentid, 'recvonly');
+            const pc = createPeerConnection(parentid, 'recvonly', myCodecPolicyRef.current);
             // Store the peer connection in the ref
             pcsRef.current[parentid] = pc;
 
@@ -326,32 +336,42 @@ function App() {
             socketRef.current?.emit('offer', { to: parentid, data: offer });
         });
 
+        // 2026-04-20 offer 수신 처리 시 codec 정책 적용 추가
+        // 부모는 자식에게 보내는 쪽이므로, 자식이 원하는 codec policy를 따라야 함.
+        socketRef.current.on(
+            'offer',
+            async ({
+                from,
+                data,
+                codecPolicy = 'default'
+            }: {
+                from: string,
+                data: any,
+                codecPolicy?: 'default' | 'vp8' | 'h264'
+            }) => {
+                console.log(`[Peer] Received offer from ${from}`, data, 'codecPolicy=', codecPolicy);
 
-        socketRef.current.on('offer', async ({ from, data }: { from: string, data: any }) => {
-            console.log(`[Peer] Received offer from ${from}`, data);
+                pcsRef.current[from] = createPeerConnection(from, 'sendonly', codecPolicy);
+                const pc = pcsRef.current[from];
+                // 보내기 전 Bit rate 설정
+                // setVideoBitrate(from, BitrateConfig.min)
 
-            // 트리구조이기 때문에 sendonly 연결 생성
-            pcsRef.current[from] = createPeerConnection(from, 'sendonly');
-            const pc = pcsRef.current[from];
-            // 보내기 전 Bit rate 설정
-            // setVideoBitrate(from, BitrateConfig.min)
+                await pc.setRemoteDescription(new RTCSessionDescription(data));
+                // RemoteDescription 설정 직후 대기열 처리!! <DG>
+                await flushPendingCandidates(from);
+                const answer = await pc.createAnswer();
 
-            await pc.setRemoteDescription(new RTCSessionDescription(data));
-            // RemoteDescription 설정 직후 대기열 처리!! <DG>
-            await flushPendingCandidates(from);
-            const answer = await pc.createAnswer();
+                let finalSdp: any = answer;
+                if (isRootRef.current) {
+                    // 내가 방장이면 높은 비트레이트를 SDP에 강제로 삽입
+                    const newSdp = setMaxBandwidth(answer.sdp || '', 'video', BITRATE);
+                    finalSdp = newSdp ? { type: answer.type, sdp: newSdp } : answer;
+                }
 
-            let finalSdp: any = answer;
-            if (isRootRef.current) {
-                // 내가 방장이면 높은 비트레이트를 SDP에 강제로 삽입
-                const newSdp = setMaxBandwidth(answer.sdp || '', 'video', BITRATE);
-                finalSdp = newSdp ? { type: answer.type, sdp: newSdp } : answer;
-            }
-
-            await pc.setLocalDescription(finalSdp);
-            socketRef.current?.emit('answer', { to: from, data: finalSdp });
-            // console.log(`[Peer] Sent Answer to ${from}`, finalSdp);
-        });
+                await pc.setLocalDescription(finalSdp);
+                socketRef.current?.emit('answer', { to: from, data: finalSdp });
+                // console.log(`[Peer] Sent Answer to ${from}`, finalSdp);
+            });
 
         socketRef.current.on('answer', async ({ from, data }: { from: string, data: any }) => {
             const pc = pcsRef.current[from];
@@ -511,9 +531,57 @@ function App() {
 
     }, []);
 
+    // 2026-04-20 codec 정책 관리용 타입 정의
+    type RTCRtpCodecCapabilityLite = {
+        mimeType: string;
+        clockRate?: number;
+        channels?: number;
+        sdpFmtpLine?: string;
+    };
+
+    // 2026-04-20 codec helper
+    const applyVideoCodecPreference = (
+        transceiver: RTCRtpTransceiver,
+        codecPolicy: 'default' | 'vp8' | 'h264'
+    ) => {
+        if (!transceiver || !('setCodecPreferences' in transceiver)) return;
+        if (codecPolicy === 'default') return;
+
+        const capabilities = RTCRtpReceiver.getCapabilities('video');
+        if (!capabilities?.codecs) return;
+
+        const codecs = capabilities.codecs as RTCRtpCodecCapabilityLite[];
+        let preferredCodecs: RTCRtpCodecCapabilityLite[] = [];
+
+        if (codecPolicy === 'vp8') {
+            preferredCodecs = codecs.filter(c => c.mimeType === 'video/VP8');
+        } else if (codecPolicy === 'h264') {
+            preferredCodecs = codecs.filter(c => c.mimeType === 'video/H264');
+        }
+
+        if (preferredCodecs.length === 0) {
+            console.warn(`[Peer] No codec found for policy=${codecPolicy}`);
+            return;
+        }
+
+        try {
+            (transceiver as RTCRtpTransceiver & {
+                setCodecPreferences: (codecs: RTCRtpCodecCapabilityLite[]) => void;
+            }).setCodecPreferences(preferredCodecs);
+
+            console.log(`[Peer] Codec preference set: ${codecPolicy}`);
+        } catch (e) {
+            console.error(`[Peer] setCodecPreferences failed for ${codecPolicy}`, e);
+        }
+    };
+    // 2026-04-20 codec helper - renegotiateSamePc에서 사용
     // useCallback을 사용하여 createPeerConnection 함수를 메모이제이션
     // peerId - parameter; 나와 연결될 피어, RTCPeerConnection - return type
-    const createPeerConnection = useCallback((peerId: string, type: string): RTCPeerConnection => {
+    const createPeerConnection = useCallback((
+        peerId: string,
+        type: string,
+        codecPolicy: 'default' | 'vp8' | 'h264' = 'default'
+    ): RTCPeerConnection => {
 
 
         console.log(`[Peer] createPeerConnection ${peerId}`);
@@ -521,26 +589,13 @@ function App() {
         pcTypesRef.current[peerId] = type;
         const pc = new RTCPeerConnection(pcConfig);
         // const pc = new RTCPeerConnection(config);
+        // 2026-04-20 codec 정책 적용 추가
         if (type === 'recvonly') {
-            console.log(`[Peer] Setting up recvonly connection `);
+            console.log(`[Peer] Setting up recvonly connection. codecPolicy=${codecPolicy}`);
             const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
             pc.addTransceiver('audio', { direction: 'recvonly' });
 
-            // [추가됨] 자식(수신처)이 Offer를 던질 때도 H.264를 1순위로 만들어야 함!
-            if (videoTransceiver && 'setCodecPreferences' in videoTransceiver) {
-                const capabilities = RTCRtpReceiver.getCapabilities('video');
-                if (capabilities && capabilities.codecs) {
-                    const h264Codecs = capabilities.codecs.filter(c => c.mimeType === 'video/H264');
-                    if (h264Codecs.length > 0) {
-                        try {
-                            videoTransceiver.setCodecPreferences(h264Codecs);
-                            console.log(`[Peer] H.264 preference set for recvonly connection`);
-                        } catch (e) {
-                            console.error('H264 preference failed for recvonly', e);
-                        }
-                    }
-                }
-            }
+            applyVideoCodecPreference(videoTransceiver, codecPolicy);
         }
         else {
             /* <DG> 기존 코드 주석 처리함. 2026.01.29.
@@ -572,20 +627,8 @@ function App() {
 
                         // [2] 하드웨어 가속기(HW Encoder)를 무조건 깨우도록 H.264 코덱 강제 적용
                         const transceiver = pc.getTransceivers().find(t => t.sender === sender);
-                        if (transceiver && 'setCodecPreferences' in transceiver) {
-                            const capabilities = RTCRtpReceiver.getCapabilities('video');
-                            if (capabilities && capabilities.codecs) {
-                                // 컴퓨터가 지원하는 코덱 리스트 중에서 H.264만 뽑아냅니다.
-                                const h264Codecs = capabilities.codecs.filter(c => c.mimeType === 'video/H264');
-                                if (h264Codecs.length > 0) {
-                                    try {
-                                        transceiver.setCodecPreferences(h264Codecs); // H.264 최우선 협상
-                                        console.log(`[Peer] H.264 Hardware Encoder preference set for ${peerId}`);
-                                    } catch (e) {
-                                        console.error('H264 preference failed', e);
-                                    }
-                                }
-                            }
+                        if (transceiver) {
+                            applyVideoCodecPreference(transceiver, codecPolicy);
                         }
                     }
                 });
