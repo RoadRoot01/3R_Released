@@ -1,4 +1,4 @@
-# WebRTC Android Native Client
+# WebRTC Android
 
 안드로이드 네이티브 환경에서 WebRTC 화상 통화 및 화면 공유를 지원
 
