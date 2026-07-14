@@ -17,7 +17,7 @@ app.use(express.static(__dirname));
 
 // WebSocket 서버 붙이기
 
-httpsServer.listen(8000, '0.0.0.0', () => {
+httpsServer.listen(8888, '0.0.0.0', () => {
     console.log(' HTTPS server running');
 });
 

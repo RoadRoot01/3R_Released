@@ -1,0 +1,14 @@
+{
+  "name": "webcodec-insertable-1n-test",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal 1:N WebRTC sender-only Insertable Streams test with WebCodecs encoded payload replacement.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "socket.io": "^4.8.0"
+  }
+}

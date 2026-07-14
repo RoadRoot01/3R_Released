@@ -1,4 +1,6 @@
 /*
+
+ @@ Webcodec에 InsertableStream 기반 영상 처리 파이프라인 추가
     WebRTC Peer (React + TypeScript)
     1) 로컬 미디어 획득 → 시그널링 서버 연결
     2) 방 참가(join) → 기존 피어 목록 수신(existing-peers)
@@ -10,6 +12,20 @@
     8) 비트레이트 제한(SDP b=AS 삽입 / sender.setParameters)
 
 */
+
+// 25.05 - <DH> Insertable Stream 기반 영상 처리 파이프라인 추가 (InsertableStream.ts)
+import {
+    DEFAULT_WEB_CODEC_INSERTABLE_CODEC,
+    setupReceiverPassthroughTransform,
+    setupWebCodecSenderTransform,
+    WebCodecInsertableCodec,
+    WebCodecSenderPipelineHandle
+} from './webcodec_insertable';
+import {
+    createWebCodecRoundTripStream,
+    WebCodecRoundTripHandle
+} from './webcodec_transform';
+
 import React, { use, useCallback, useEffect, useRef, useState } from 'react';
 // import logo from './logo.svg';
 import './App.css';
@@ -34,6 +50,7 @@ const BitrateConfig: Record<BitrateLevel, number> = {
 const BITRATE: number = 50000; // <DG> 50Mbps. setMaxBandwidth를 이용하는 경우에만 이 값을 적용해야 함. (setVideoBitrate는 기본 단위가 kbps가 아니라 bps임.) 
 
 const MAX_REDIAL_ATTEMPTS = 2; // 최대 재연결 시도 횟수
+const WEB_CODEC_INSERTABLE_CODEC: WebCodecInsertableCodec = DEFAULT_WEB_CODEC_INSERTABLE_CODEC; // 'vp8'로 바꾸면 VP8 payload를 사용
 
 const displayMediaOptions = {
     video: {
@@ -51,9 +68,9 @@ const displayMediaOptions = {
 
 const constraints = { // <DG> 해상도 및 프레임레이트 제약 설정 프리셋
     video: {
-        width: { ideal: 1920, max: 1920 }, // max를 1920으로 수정
-        height: { ideal: 1080, max: 1080 }, // max를 720에서 1080으로 수정
-        frameRate: { ideal: 60, max: 60 },
+        width: { ideal: 1280, max: 1280 }, // max를 1920으로 수정
+        height: { ideal: 720, max: 720 }, // max를 720에서 1080으로 수정
+        frameRate: { ideal: 15, max: 15 },
     },
     audio: true
 };
@@ -62,7 +79,7 @@ const constraints = { // <DG> 해상도 및 프레임레이트 제약 설정 프
 // const MODE: string = '1_TO_N'; // '1_TO_N' or 'MESH'
 
 // 소켓 인스턴스를 컴포넌트 외부에서 한 번만 생성하여 재렌더링 시 재생성을 방지?
-export const SIGNALING_SERVER_URL = `https://192.168.219.103:8000`;
+export const SIGNALING_SERVER_URL = `https://192.168.1.50:8888`;
 
 
 // const socket = io(`https://192.168.0.8:8000`, { autoConnect: false });
@@ -107,14 +124,17 @@ function App() {
     /* 상대 ICE 후보 버퍼링: RemoteDescription 미설정 시 후보 임시 저장 */
     const localStreamRef = useRef<MediaStream>(null);
     const localVideoRef = useRef<HTMLVideoElement>(null);
-
+    /* WebCodec 기반 영상 처리 파이프라인 핸들 참조 */
+    const webCodecRoundTripRef = useRef<WebCodecRoundTripHandle | null>(null);
+    const webCodecSenderPipelinesRef = useRef<Record<string, WebCodecSenderPipelineHandle[]>>({});
+    const receiverTransformWorkersRef = useRef<Record<string, Worker[]>>({});
     const myidRef = useRef<string>('');
     const localStreamSortRef = useRef<string>('userMedia');
 
     const hasStreamChangedRef = useRef<boolean>(false);
     const pcTypesRef = useRef<Record<string, string>>({});
-    // 2026-04-20 codec 정책 관리용 Ref (default, vp8, h264)
-    const myCodecPolicyRef = useRef<'default' | 'vp8' | 'h264'>('default');
+    // 2026-04-20 codec 정책 관리용 Ref (default, vp9, vp8, h264)
+    const myCodecPolicyRef = useRef<'default' | 'vp9' | 'vp8' | 'h264'>('default');
 
     // 사용자 상태(React state)
     const [users, setUsers] = useState<WebRTCUser[]>([]);
@@ -128,6 +148,67 @@ function App() {
     const forceDisconnectPeerRef = useRef<(peerId: string) => boolean>(() => false);
     /* 송신 비트레이트 설정: RTCRtpSender.setParameters 기반 */
     const TIMEOUT_DURATION = 0; //0초
+
+    const stopWebCodecSenderPipelines = useCallback((peerId: string) => {
+        const handles = webCodecSenderPipelinesRef.current[peerId] || [];
+        handles.forEach(handle => {
+            try {
+                handle.stop();
+            } catch (error) {
+                console.warn(`[webcodec_insertable] Failed to stop sender pipeline for ${peerId}`, error);
+            }
+        });
+        webCodecSenderPipelinesRef.current[peerId] = [];
+    }, []);
+
+    const stopReceiverTransformWorkers = useCallback((peerId: string) => {
+        const workers = receiverTransformWorkersRef.current[peerId] || [];
+        workers.forEach(worker => worker.terminate());
+        receiverTransformWorkersRef.current[peerId] = [];
+    }, []);
+
+    const setupWebCodecSenderForPeer = useCallback(async (
+        peerId: string,
+        sender: RTCRtpSender,
+        stream: MediaStream
+    ) => {
+        try {
+            const handle = await setupWebCodecSenderTransform(sender, stream, {
+                codec: WEB_CODEC_INSERTABLE_CODEC,
+                width: 640,
+                height: 480,
+                framerate: 30,
+                bitrate: 1_200_000,
+                keyFrameIntervalSeconds: 2,
+            });
+
+            if (!handle) {
+                return;
+            }
+
+            if (!webCodecSenderPipelinesRef.current[peerId]) {
+                webCodecSenderPipelinesRef.current[peerId] = [];
+            }
+            webCodecSenderPipelinesRef.current[peerId].push(handle);
+            console.log(`[webcodec_insertable] Sender transform attached for ${peerId}`);
+        } catch (error) {
+            console.error(`[webcodec_insertable] Failed to attach sender transform for ${peerId}`, error);
+        }
+    }, []);
+
+    const setupReceiverTransformForPeer = useCallback((peerId: string, receiver: RTCRtpReceiver) => {
+        const worker = setupReceiverPassthroughTransform(receiver);
+
+        if (!worker) {
+            return;
+        }
+
+        if (!receiverTransformWorkersRef.current[peerId]) {
+            receiverTransformWorkersRef.current[peerId] = [];
+        }
+        receiverTransformWorkersRef.current[peerId].push(worker);
+        console.log(`[webcodec_insertable] Receiver passthrough transform attached for ${peerId}`);
+    }, []);
 
     const setVideoBitrate = useCallback(async (peerId: string, bitrate: number) => {
         const pc = pcsRef.current[peerId];
@@ -228,48 +309,215 @@ function App() {
     */
 
     // useCallback을 사용하여 getLocalStream 함수를 메모이제이션
+    // const getLocalStream = useCallback(async () => {
+    //     try {
+    //         console.log('getLocalStream....');
+    //         // 추후 localStreamRef로 로컬 비디오 컴포넌트에서 사용
+
+    //         localStreamRef.current = await navigator.mediaDevices.getDisplayMedia(constraints);
+
+    //         //localStreamRef.current = await navigator.mediaDevices.getUserMedia(constraints);
+
+    //         if (localVideoRef.current) {
+    //             localVideoRef.current.srcObject = localStreamRef.current;
+    //         }
+    //     }
+    //     catch (error) {
+    //         console.error('Error accessing media devices.', error);
+    //     }
+    // }, []);
     const getLocalStream = useCallback(async () => {
         try {
             console.log('getLocalStream....');
-            // 추후 localStreamRef로 로컬 비디오 컴포넌트에서 사용
 
-            localStreamRef.current = await navigator.mediaDevices.getDisplayMedia(constraints);
+            /*
+              1. 원본 카메라 스트림 획득
+            */
+            const rawStream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                    width: { ideal: 640, max: 640 },
+                    height: { ideal: 480, max: 480 },
+                    frameRate: { ideal: 30, max: 30 },
+                },
+                audio: true
+            });
 
-            //localStreamRef.current = await navigator.mediaDevices.getUserMedia(constraints);
+            console.log('[Peer] Raw local stream obtained:', {
+                rawStream,
+                videoTracks: rawStream.getVideoTracks(),
+                audioTracks: rawStream.getAudioTracks(),
+            });
 
+            /*
+              2. 여기가 webcodec-transform.js 내용이 들어가는 위치
+    
+              rawStream video track
+                -> MediaStreamTrackProcessor
+                -> VideoEncoder
+                -> VideoDecoder
+                -> MediaStreamTrackGenerator
+                -> processedStream
+    
+              결과 processedStream을 localStreamRef.current에 넣는다.
+            */
+            const webCodecRoundTrip = await createWebCodecRoundTripStream(rawStream, {
+                codec: 'vp8',
+
+                /*
+                  H.264 테스트를 하고 싶으면 위 codec을 'h264'로 바꿔볼 수 있다.
+                  단, 브라우저/OS/하드웨어 지원 여부에 따라 실패할 수 있다.
+                */
+                // codec: 'h264',
+
+                width: 640,
+                height: 480,
+                framerate: 30,
+                bitrate: 2_000_000,
+                hardwareAcceleration: 'prefer-software', // 'prefer-hardware'로 설정하면 하드웨어 가속 우선, 'prefer-software'로 설정하면 소프트웨어 인코딩 우선
+                latencyMode: 'realtime',
+            });
+
+            webCodecRoundTripRef.current = webCodecRoundTrip;
+
+            /*
+              3. 핵심:
+              localStreamRef.current에는 원본 rawStream이 아니라
+              WebCodecs encode/decode를 통과한 processedStream을 넣는다.
+            */
+            localStreamRef.current = webCodecRoundTrip.processedStream;
+
+            /*
+              4. 로컬 preview도 processedStream으로 확인
+              화면이 보인다면 VideoEncoder -> VideoDecoder -> Generator까지 통과한 것.
+            */
             if (localVideoRef.current) {
                 localVideoRef.current.srcObject = localStreamRef.current;
             }
+
+            console.log('[Peer] Processed local stream set:', {
+                processedStream: localStreamRef.current,
+                processedVideoTracks: localStreamRef.current.getVideoTracks(),
+                processedAudioTracks: localStreamRef.current.getAudioTracks(),
+            });
+
+            /*
+              5. processedStream 준비 후 signaling 연결 시작
+            */
+            console.log('[Peer] Connecting to signaling server...');
+            socketRef.current?.connect();
         }
         catch (error) {
-            console.error('Error accessing media devices.', error);
+            console.error('Error accessing media devices or creating WebCodec round-trip pipeline.', error);
         }
     }, []);
-
     /* 스트림 교체 함수 */
+    // const changeStream = useCallback(async () => {
+
+
+
+    //     if (localStreamSortRef.current === 'userMedia') {
+    //         console.log(`[Peer] Current stream is not a display source. Changing stream...`);
+    //         localStreamRef.current = await navigator.mediaDevices.getDisplayMedia(constraints);
+
+    //         // localStreamRef.current = (await navigator.mediaDevices.getUserMedia({ video: true, audio: true }));
+
+    //         if (localVideoRef.current) {
+    //             localVideoRef.current.srcObject = localStreamRef.current;
+    //         }
+    //         // 모든 피어에 대해 트랙을 교체
+    //         // Object.values() : pcsRef.current 객체의 값들(즉, RTCPeerConnection 인스턴스들)을 배열로 반환
+    //         Object.values(pcsRef.current).forEach(pc => {
+    //             // pc에서 내보내는 트랙들을 가져옴
+    //             const senders = pc.getSenders();
+    //             localStreamRef.current!.getTracks().forEach(track => {
+    //                 // localStreamRef의 각 트랙에 대해, 동일한 종류(kind)의 트랙을 보내는 송신자(sender)를 찾음
+    //                 const sender = senders.find(s => s.track?.kind === track.kind);
+    //                 if (sender) {
+    //                     sender.replaceTrack(track);
+    //                 }
+    //             });
+    //         });
+    //     } else {
+    //         console.log(`[Peer] Current stream is already a display source. Skipping changeStream.`);
+    //     }
+
+    //     localStreamSortRef.current = 'displayMedia';
+
+    // }, []);
     const changeStream = useCallback(async () => {
-
-
-
         if (localStreamSortRef.current === 'userMedia') {
             console.log(`[Peer] Current stream is not a display source. Changing stream...`);
-            localStreamRef.current = await navigator.mediaDevices.getDisplayMedia(constraints);
 
-            // localStreamRef.current = (await navigator.mediaDevices.getUserMedia({ video: true, audio: true }));
+            /*
+              기존 WebCodec round-trip pipeline 종료
+            */
+            if (webCodecRoundTripRef.current) {
+                webCodecRoundTripRef.current.abort();
+                webCodecRoundTripRef.current = null;
+            }
 
+            /*
+              1. 원본 화면 공유 스트림 획득
+            */
+            const rawDisplayStream = await navigator.mediaDevices.getDisplayMedia({
+                video: {
+                    width: { ideal: 640, max: 640 },
+                    height: { ideal: 480, max: 480 },
+                    frameRate: { ideal: 30, max: 30 },
+                },
+                audio: true
+            });
+
+            console.log('[Peer] Raw display stream obtained:', {
+                rawDisplayStream,
+                videoTracks: rawDisplayStream.getVideoTracks(),
+                audioTracks: rawDisplayStream.getAudioTracks(),
+            });
+
+            /*
+              2. 화면 공유 track도 WebCodecs VideoEncoder -> VideoDecoder 통과
+            */
+            const webCodecRoundTrip = await createWebCodecRoundTripStream(rawDisplayStream, {
+                codec: 'vp8',
+                // codec: 'h264',
+                width: 640,
+                height: 480,
+                framerate: 30,
+                bitrate: 2_000_000,
+                hardwareAcceleration: 'prefer-hardware',
+                latencyMode: 'realtime',
+            });
+
+            webCodecRoundTripRef.current = webCodecRoundTrip;
+            localStreamRef.current = webCodecRoundTrip.processedStream;
+
+            /*
+              3. 로컬 preview도 processedStream으로 교체
+            */
             if (localVideoRef.current) {
                 localVideoRef.current.srcObject = localStreamRef.current;
             }
-            // 모든 피어에 대해 트랙을 교체
-            // Object.values() : pcsRef.current 객체의 값들(즉, RTCPeerConnection 인스턴스들)을 배열로 반환
-            Object.values(pcsRef.current).forEach(pc => {
-                // pc에서 내보내는 트랙들을 가져옴
+
+            /*
+              4. 이미 연결된 peer들의 sender track 교체
+            */
+            Object.entries(pcsRef.current).forEach(([remotePeerId, pc]) => {
                 const senders = pc.getSenders();
+                stopWebCodecSenderPipelines(remotePeerId);
+
                 localStreamRef.current!.getTracks().forEach(track => {
-                    // localStreamRef의 각 트랙에 대해, 동일한 종류(kind)의 트랙을 보내는 송신자(sender)를 찾음
                     const sender = senders.find(s => s.track?.kind === track.kind);
+
                     if (sender) {
+                        console.log('[Peer] replaceTrack with WebCodec processed track:', {
+                            kind: track.kind,
+                            track,
+                        });
+
                         sender.replaceTrack(track);
+                        if (track.kind === 'video') {
+                            void setupWebCodecSenderForPeer(remotePeerId, sender, localStreamRef.current!);
+                        }
                     }
                 });
             });
@@ -278,9 +526,7 @@ function App() {
         }
 
         localStreamSortRef.current = 'displayMedia';
-
-    }, []);
-
+    }, [setupWebCodecSenderForPeer, stopWebCodecSenderPipelines]);
 
     // 비디오 컴포넌트 이외는 한 번만 렌더링
     useEffect(() => {
@@ -307,7 +553,7 @@ function App() {
             console.log('My ID set to state:', myidRef.current);
         });
         // 2026-04-20 서버에서 codec 정책 수신 처리 추가
-        socketRef.current.on('codec-policy', (policy: 'default' | 'vp8' | 'h264') => {
+        socketRef.current.on('codec-policy', (policy: 'default' | 'vp9' | 'vp8' | 'h264') => {
             myCodecPolicyRef.current = policy;
             console.log('[Peer] My codec policy:', policy);
         });
@@ -347,7 +593,7 @@ function App() {
             }: {
                 from: string,
                 data: any,
-                codecPolicy?: 'default' | 'vp8' | 'h264'
+                codecPolicy?: 'default' | 'vp9' | 'vp8' | 'h264'
             }) => {
                 console.log(`[Peer] Received offer from ${from}`, data, 'codecPolicy=', codecPolicy);
 
@@ -468,6 +714,8 @@ function App() {
                 // PC cleanup 공통 로직
                 if (targetPc) {
                     targetPc.close();
+                    stopWebCodecSenderPipelines(key);
+                    stopReceiverTransformWorkers(key);
                 }
                 // pcsRef 초기화
                 pcsRef.current = {};
@@ -475,6 +723,8 @@ function App() {
                 pendingCandRef.current = {};
                 iceCandidateGatheredArrayRef.current = {};
                 redialCountsRef.current = {};
+                webCodecSenderPipelinesRef.current = {};
+                receiverTransformWorkersRef.current = {};
                 // 사용자 목록 초기화
                 setUsers([]);
                 // setUsers(prev => prev.filter(u => u.id !== key));
@@ -517,6 +767,8 @@ function App() {
 
                         // 연결 종료
                         pc.close();
+                        stopWebCodecSenderPipelines(key);
+                        stopReceiverTransformWorkers(key);
                         console.log(`[App] Closed connection with ${key}`);
                     }
                     delete pcsRef.current[key];
@@ -527,6 +779,12 @@ function App() {
                 clearTimeout(noticeTimerRef.current);
                 noticeTimerRef.current = null;
             }
+            // WebCodec 파이프라인 정리
+            if (webCodecRoundTripRef.current) {
+                webCodecRoundTripRef.current.abort();
+                webCodecRoundTripRef.current = null;
+            }
+
         };
 
     }, []);
@@ -542,7 +800,7 @@ function App() {
     // 2026-04-20 codec helper
     const applyVideoCodecPreference = (
         transceiver: RTCRtpTransceiver,
-        codecPolicy: 'default' | 'vp8' | 'h264'
+        codecPolicy: 'default' | 'vp9' | 'vp8' | 'h264'
     ) => {
         if (!transceiver || !('setCodecPreferences' in transceiver)) return;
         if (codecPolicy === 'default') return;
@@ -553,7 +811,9 @@ function App() {
         const codecs = capabilities.codecs as RTCRtpCodecCapabilityLite[];
         let preferredCodecs: RTCRtpCodecCapabilityLite[] = [];
 
-        if (codecPolicy === 'vp8') {
+        if (codecPolicy === 'vp9') {
+            preferredCodecs = codecs.filter(c => c.mimeType === 'video/VP9');
+        } else if (codecPolicy === 'vp8') {
             preferredCodecs = codecs.filter(c => c.mimeType === 'video/VP8');
         } else if (codecPolicy === 'h264') {
             preferredCodecs = codecs.filter(c => c.mimeType === 'video/H264');
@@ -580,7 +840,7 @@ function App() {
     const createPeerConnection = useCallback((
         peerId: string,
         type: string,
-        codecPolicy: 'default' | 'vp8' | 'h264' = 'default'
+        codecPolicy: 'default' | 'vp9' | 'vp8' | 'h264' = 'default'
     ): RTCPeerConnection => {
 
 
@@ -595,7 +855,7 @@ function App() {
             const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
             pc.addTransceiver('audio', { direction: 'recvonly' });
 
-            applyVideoCodecPreference(videoTransceiver, codecPolicy);
+            applyVideoCodecPreference(videoTransceiver, WEB_CODEC_INSERTABLE_CODEC);
         }
         else {
             /* <DG> 기존 코드 주석 처리함. 2026.01.29.
@@ -628,8 +888,9 @@ function App() {
                         // [2] 하드웨어 가속기(HW Encoder)를 무조건 깨우도록 H.264 코덱 강제 적용
                         const transceiver = pc.getTransceivers().find(t => t.sender === sender);
                         if (transceiver) {
-                            applyVideoCodecPreference(transceiver, codecPolicy);
+                            applyVideoCodecPreference(transceiver, WEB_CODEC_INSERTABLE_CODEC);
                         }
+                        void setupWebCodecSenderForPeer(peerId, sender, localStreamRef.current!);
                     }
                 });
             } else {
@@ -689,6 +950,8 @@ function App() {
                 }
                 delete pcsRef.current[peerId];
                 delete pcTypesRef.current[peerId];
+                stopWebCodecSenderPipelines(peerId);
+                stopReceiverTransformWorkers(peerId);
                 pendingCandRef.current[peerId] = [];
                 iceCandidateGatheredArrayRef.current[peerId] = [];
                 redialCountsRef.current[peerId] = (redialCountsRef.current[peerId] || 0) + 1;
@@ -740,6 +1003,7 @@ function App() {
             // ...user : user의 나머지 속성들을 복사
 
             const stream = event.streams[0];
+            setupReceiverTransformForPeer(peerId, event.receiver);
             const socket = socketRef.current;
             if (socket) {
                 setUsers(prev =>
@@ -769,11 +1033,13 @@ function App() {
                     // '자식/다른 연결'에만 보내고 싶으면 부모는 제외
                     if (childPc === pc) return;
 
+                    stopWebCodecSenderPipelines(remotePeerId);
                     childPc.getSenders().forEach((sender) => {
                         if (!sender.track) return;
 
                         if (sender.track.kind === "video") {
                             sender.replaceTrack(newVideo);
+                            void setupWebCodecSenderForPeer(remotePeerId, sender, stream);
                         }
                         if (sender.track.kind === "audio") {
                             sender.replaceTrack(newAudio);
@@ -894,6 +1160,8 @@ function App() {
         delete pcsRef.current[peerId];
         delete pcTypesRef.current[peerId];
         if (pendingCandRef.current) pendingCandRef.current[peerId] = [];
+        stopWebCodecSenderPipelines(peerId);
+        stopReceiverTransformWorkers(peerId);
 
         // setUsers(prev => prev.filter(u => u.id !== peerId));
 
@@ -926,6 +1194,8 @@ function App() {
         pendingCandRef.current = {};
         iceCandidateGatheredArrayRef.current = {};
         redialCountsRef.current = {};
+        webCodecSenderPipelinesRef.current = {};
+        receiverTransformWorkersRef.current = {};
         // 사용자 목록 초기화
         setUsers([]);
         console.log(`[RESET] Successfully disconnected ${disconnectedCount} peers`);

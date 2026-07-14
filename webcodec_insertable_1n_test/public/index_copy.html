@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebCodecs Insertable 1:N Test</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main>
+      <section class="toolbar">
+        <div>
+          <h1>WebCodecs Insertable 1:N</h1>
+          <p>Teacher sends only. Viewers receive only. Receiver Insertable Streams are intentionally disabled.</p>
+        </div>
+        <label>
+          Room
+          <input id="roomInput" value="insertable-test" />
+        </label>
+        <label>
+          Codec
+          <select id="codecSelect">
+            <option value="vp8" selected>VP8</option>
+            <option value="vp9">VP9</option>
+          </select>
+        </label>
+        <button id="teacherButton">Join as Teacher</button>
+        <button id="viewerButton">Join as Viewer</button>
+        <button id="stopButton">Stop</button>
+      </section>
+
+      <section class="videos">
+        <div>
+          <h2>Local</h2>
+          <video id="localVideo" autoplay playsinline muted></video>
+        </div>
+        <div>
+          <h2>Remote</h2>
+          <video id="remoteVideo" autoplay playsinline controls></video>
+        </div>
+      </section>
+
+      <section class="status">
+        <h2>Status</h2>
+        <pre id="log"></pre>
+      </section>
+    </main>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
