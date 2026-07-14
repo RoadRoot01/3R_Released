@@ -16,6 +16,7 @@ import React, { use, useCallback, useEffect, useRef, useState } from 'react';
 import './App.css';
 import io from 'socket.io-client';
 import Video from './component/remoteVideo';
+import { createRedBoxOverlayStream, RedBoxOverlayPipeline } from './InsertableStreamsOverlay';
 
 export interface WebRTCUser {
     id: string;
@@ -61,7 +62,7 @@ const constraints = { // <DG> 해상도 및 프레임레이트 제약 설정 프
 // const MODE: string = '1_TO_N'; // '1_TO_N' or 'MESH'
 
 // 소켓 인스턴스를 컴포넌트 외부에서 한 번만 생성하여 재렌더링 시 재생성을 방지?
-export const SIGNALING_SERVER_URL = `https://192.168.0.37:8000`
+export const SIGNALING_SERVER_URL = `https://192.168.1.50:8000`
 
 // const socket = io(`https://192.168.0.8:8000`, { autoConnect: false });
 const pcConfig: RTCConfiguration = {
@@ -105,6 +106,7 @@ function App() {
     /* 상대 ICE 후보 버퍼링: RemoteDescription 미설정 시 후보 임시 저장 */
     const localStreamRef = useRef<MediaStream>(null);
     const localVideoRef = useRef<HTMLVideoElement>(null);
+    const localRedBoxOverlayRef = useRef<RedBoxOverlayPipeline | null>(null);
 
     const myidRef = useRef<string>('');
     const localStreamSortRef = useRef<string>('userMedia');
@@ -123,6 +125,33 @@ function App() {
     const forceDisconnectPeerRef = useRef<(peerId: string) => boolean>(() => false);
     /* 송신 비트레이트 설정: RTCRtpSender.setParameters 기반 */
     const TIMEOUT_DURATION = 0; //0초
+
+    // <DH> 로컬 캡처 스트림만 가공본으로 교체함. remoteStream 경로는 건드리지 않음.
+    const applyLocalRedBoxOverlay = (sourceStream: MediaStream): MediaStream => {
+        localRedBoxOverlayRef.current?.stop();
+        const pipeline = createRedBoxOverlayStream(sourceStream);
+        localRedBoxOverlayRef.current = pipeline;
+        return pipeline.stream;
+    };
+
+    // <DH> 이미 연결된 자식 피어 sender도 가공된 로컬 트랙으로 즉시 교체함.
+    const replaceLocalRelayTracks = (stream: MediaStream) => {
+        const videoTrack = stream.getVideoTracks()[0] ?? null;
+        const audioTrack = stream.getAudioTracks()[0] ?? null;
+
+        Object.entries(pcsRef.current).forEach(([peerId, pc]) => {
+            if (pcTypesRef.current[peerId] !== 'sendonly') return;
+
+            pc.getSenders().forEach(sender => {
+                const replacement = sender.track?.kind === 'video' ? videoTrack : audioTrack;
+                if (!replacement || sender.track === replacement) return;
+
+                sender.replaceTrack(replacement).catch(error => {
+                    console.error(`[Insertable Streams] Failed to replace local relay track for ${peerId}.`, error);
+                });
+            });
+        });
+    };
 
     const setVideoBitrate = useCallback(async (peerId: string, bitrate: number) => {
         const pc = pcsRef.current[peerId];
@@ -228,7 +257,9 @@ function App() {
             console.log('getLocalStream....');
             // 추후 localStreamRef로 로컬 비디오 컴포넌트에서 사용
 
-            localStreamRef.current = await navigator.mediaDevices.getDisplayMedia(constraints);
+            const sourceStream = await navigator.mediaDevices.getDisplayMedia(constraints);
+            localStreamRef.current = applyLocalRedBoxOverlay(sourceStream);
+            // replaceLocalRelayTracks(localStreamRef.current);
 
             //localStreamRef.current = await navigator.mediaDevices.getUserMedia(constraints);
 
@@ -248,7 +279,9 @@ function App() {
 
         if (localStreamSortRef.current === 'userMedia') {
             console.log(`[Peer] Current stream is not a display source. Changing stream...`);
-            localStreamRef.current = await navigator.mediaDevices.getDisplayMedia(constraints);
+            const sourceStream = await navigator.mediaDevices.getDisplayMedia(constraints);
+            localStreamRef.current = applyLocalRedBoxOverlay(sourceStream);
+            replaceLocalRelayTracks(localStreamRef.current);
 
             // localStreamRef.current = (await navigator.mediaDevices.getUserMedia({ video: true, audio: true }));
 
@@ -463,6 +496,8 @@ function App() {
 
         return () => {
             console.log('[App] Cleaning up resources...');
+            localRedBoxOverlayRef.current?.stop();
+            localRedBoxOverlayRef.current = null;
 
             // 소켓 연결 종료
             if (socketRef.current) {
