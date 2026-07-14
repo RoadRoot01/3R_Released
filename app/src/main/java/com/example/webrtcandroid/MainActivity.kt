@@ -1199,10 +1199,12 @@ class DynamicVideoEncoderFactory(
     }
 
     override fun getSupportedCodecs(): Array<VideoCodecInfo> {
-        val mode = getMode()
-        val codecs = currentFactory.supportedCodecs
-        Log.d("WebRTC_Factory", "DynamicVideoEncoderFactory: 지원 코덱 쿼리됨. 모드: $mode, 코덱 개수: ${codecs.size}")
-        return codecs
+        // 하드웨어 코덱과 소프트웨어 코덱을 일단 합친 뒤, 이름 기준(대소문자 무시)으로 중복을 제거합니다.
+        val allCodecs = (hardwareFactory.supportedCodecs + softwareFactory.supportedCodecs)
+            .distinctBy { it.name.uppercase() }
+        
+        Log.d("WebRTC_Factory", "DynamicVideoEncoderFactory: 지원 코덱 통합 목록 반환 (총 개수: ${allCodecs.size})")
+        return allCodecs.toTypedArray()
     }
 }
 
