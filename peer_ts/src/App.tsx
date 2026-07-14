@@ -258,11 +258,9 @@ function App() {
             // 추후 localStreamRef로 로컬 비디오 컴포넌트에서 사용
 
             const sourceStream = await navigator.mediaDevices.getDisplayMedia(constraints);
-            localStreamRef.current = applyLocalRedBoxOverlay(sourceStream);
-            // replaceLocalRelayTracks(localStreamRef.current);
-
             //localStreamRef.current = await navigator.mediaDevices.getUserMedia(constraints);
-
+            localStreamRef.current = applyLocalRedBoxOverlay(sourceStream);
+            replaceLocalRelayTracks(localStreamRef.current);
             if (localVideoRef.current) {
                 localVideoRef.current.srcObject = localStreamRef.current;
             }
@@ -280,11 +278,10 @@ function App() {
         if (localStreamSortRef.current === 'userMedia') {
             console.log(`[Peer] Current stream is not a display source. Changing stream...`);
             const sourceStream = await navigator.mediaDevices.getDisplayMedia(constraints);
-            localStreamRef.current = applyLocalRedBoxOverlay(sourceStream);
-            replaceLocalRelayTracks(localStreamRef.current);
 
             // localStreamRef.current = (await navigator.mediaDevices.getUserMedia({ video: true, audio: true }));
-
+            localStreamRef.current = applyLocalRedBoxOverlay(sourceStream);
+            replaceLocalRelayTracks(localStreamRef.current);
             if (localVideoRef.current) {
                 localVideoRef.current.srcObject = localStreamRef.current;
             }

@@ -28,8 +28,8 @@ return (
   <div
     style={{
       position: 'relative',
-      width: '640px', // 변경가능
-      height: '480px', // 변경가능
+      width: '1280px', // 수신 원본 비디오 너비
+      height: '720px', // 수신 원본 비디오 높이
       backgroundColor: '#2c2c2c',
       borderRadius: '8px',
       overflow: 'hidden',
@@ -47,7 +47,7 @@ return (
         style={{
           width: '100%',
           height: '100%',
-          objectFit: 'cover', // 비디오가 컨테이너를 꽉 채우도록 합니다.
+          objectFit: 'contain', // 원본 비율을 유지하고 전체 프레임을 표시합니다.
         }}
       />
     )}
